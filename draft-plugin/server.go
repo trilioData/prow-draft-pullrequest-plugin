@@ -115,7 +115,7 @@ func (s *server) handleEvent(eventType, eventGUID string, payload []byte) error 
 				"action": pr.Action,
 				"author": author,
 				"SHA": pr.PullRequest.Head.SHA,
-			})
+			}).Info("PR info")
 			if pr.PullRequest.Draft {
 				var jobs []config.Presubmit
 				for _, job := range presubmits {
