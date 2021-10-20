@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
-	"strconv"
 	"time"
+
+	"k8s.io/test-infra/prow/git/v2"
 
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -27,7 +28,7 @@ import (
 
 func helpProvider(_ []config.OrgRepo) (*pluginhelp.PluginHelp, error) {
 	pluginHelp := &pluginhelp.PluginHelp{
-		Description: `The darft plugin is used for trigger job when darft PR or convert PR to draft. Useful when you want to trigger job when PR is in draft`,
+		Description: `The draft plugin is used to trigger job when draft PR is created or convert existing PR to draft PR. Useful when you want to trigger specific jobs when PR is in draft`,
 	}
 	return pluginHelp, nil
 }
@@ -69,14 +70,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleEvent(eventType, eventGUID string, payload []byte) error {
-	l := logrus.WithFields(
-		logrus.Fields{
-			"event-type":     eventType,
-			github.EventGUID: eventGUID,
-		},
-	)
-	_ = l
 	var c *config.Config
+	var baseSHA string
 	var p = getProwClient()
 	c, err := config.Load(s.prowconfig, s.prowjob, nil, "")
 	if err != nil {
@@ -87,7 +82,6 @@ func (s *server) handleEvent(eventType, eventGUID string, payload []byte) error 
 		return err
 	}
 	org, repo, author, ref := orgRepoAuthor(pr.PullRequest)
-	baseSHA := ""
 	baseSHAGetter := func() (string, error) {
 		var err error
 		baseSHA, err = githubClient.GetRef(s.ghc, org, repo, "heads/"+ref)
@@ -101,7 +95,7 @@ func (s *server) handleEvent(eventType, eventGUID string, payload []byte) error 
 	}
 	presubmits, err := c.GetPresubmits(s.gc, org+"/"+repo, baseSHAGetter, headSHAGetter)
 	if err != nil {
-		fmt.Printf("server not responding %s", err.Error())
+		return fmt.Errorf("server not responding %s", err.Error())
 	}
 	if len(presubmits) == 0 {
 		return nil
@@ -114,16 +108,21 @@ func (s *server) handleEvent(eventType, eventGUID string, payload []byte) error 
 	if member {
 		switch pr.Action {
 		case github.PullRequestActionOpened, github.PullRequestActionSynchronize, github.PullRequestActionConvertedToDraft:
-			infomation := "{\"action\": \"" + string(pr.Action) + "\",\"author\": \"" + author + "\",\"pr\": " + strconv.Itoa(pr.Number) + "\",\"repo\": \"" + pr.Repo.Name + "\",\"SHA\": \"" + *pr.PullRequest.MergeSHA + "\"}"
-			logrus.Info(infomation)
+			logrus.WithFields(logrus.Fields{
+				github.OrgLogField: org,
+				github.RepoLogField: repo,
+				github.PrLogField: pr.Number,
+				"action": pr.Action,
+				"author": author,
+				"SHA": pr.PullRequest.Head.SHA,
+			})
 			if pr.PullRequest.Draft {
 				var jobs []config.Presubmit
 				for _, job := range presubmits {
-					match, err := regexp.MatchString(s.regex, job.Name)
-					if err != nil || !match {
-						continue
+					match, _ := regexp.MatchString(s.regex, job.Name)
+					if match {
+						jobs = append(jobs, job)
 					}
-					jobs = append(jobs, job)
 				}
 				var errors []error
 				for _, job := range jobs {
@@ -132,17 +131,17 @@ func (s *server) handleEvent(eventType, eventGUID string, payload []byte) error 
 					}
 					err := c.JobConfig.SetPresubmits(pjob)
 					if err != nil {
-						logrus.Error(err)
+						return fmt.Errorf("error generating presubmit job",err)
 					}
 					logrus.Infof("Starting %s build.", job.Name)
 					pj := pjutil.NewPresubmit(pr.PullRequest, baseSHA, job, eventGUID, nil)
 					logrus.WithFields(pjutil.ProwJobFields(&pj)).Info("Creating a new prowjob.")
-					if err := createWithRetry(context.Background(), p.ProwJobs("default"), &pj, time.Millisecond); err != nil {
+					if err := createWithRetry(context.Background(), p.ProwJobs(s.ns), &pj, time.Millisecond); err != nil {
 						logrus.WithError(err).Error("Failed to create prowjob.")
 						errors = append(errors, err)
 					}
 				}
-				logrus.Info(errors)
+				logrus.Error(errors)
 			}
 		default:
 			logrus.Debugf("skipping event of type %q", eventType)
@@ -159,8 +158,8 @@ func orgRepoAuthor(pr github.PullRequest) (string, string, string, string) {
 	return org, repo, author, ref
 }
 
-// createWithRetry will retry the cration of a ProwJob. The Name must be set, otherwise we might end up creating it multiple times
-// if one Create request errors but succeeds under the hood.
+// createWithRetry will retry the creation of a ProwJob. The Name must be set, otherwise we might end up creating it multiple times
+// if one Create request throws error but succeeds under the hood.
 func createWithRetry(ctx context.Context, client prowJobClient, pj *prowapi.ProwJob, millisecondOverride ...time.Duration) error {
 	millisecond := time.Millisecond
 	if len(millisecondOverride) == 1 {
