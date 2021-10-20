@@ -1,0 +1,22 @@
+# Binaries for programs and plugins
+
+# Test binary, build with `go test -c`
+*.test
+*junit*.xml
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# editor and IDE paraphernalia
+.idea
+*.swp
+*.swo
+*~
+
+### Python ###
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+.scannerwork/*
